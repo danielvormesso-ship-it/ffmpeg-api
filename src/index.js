@@ -269,8 +269,8 @@ function buildFFmpegCommand(inputPath, outputPath, config, assets) {
   if (needsVideoEncode) {
     cmd.push(
       '-c:v', 'libx264',
-      '-preset', 'fast',      // Server has more power, use 'fast' instead of 'ultrafast'
-      '-crf', '23',            // Better quality on server
+      '-preset', 'ultrafast',
+      '-crf', '28',
       '-pix_fmt', 'yuv420p',
       '-movflags', '+faststart'
     );
