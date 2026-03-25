@@ -14,12 +14,41 @@ const API_KEY = process.env.API_KEY || '';
 const TMP_DIR = '/app/tmp';
 const UPLOAD_DIR = path.join(TMP_DIR, 'uploads');
 const OUTPUT_DIR = path.join(TMP_DIR, 'outputs');
+const MAX_CONCURRENT_FFMPEG = Math.max(1, Number(process.env.MAX_CONCURRENT_FFMPEG || 1));
+
+let activeFfmpegJobs = 0;
+const ffmpegWaitQueue = [];
 
 // Ensure dirs exist
 [UPLOAD_DIR, OUTPUT_DIR].forEach(d => fs.mkdirSync(d, { recursive: true }));
 
 app.use(cors());
 app.use(express.json());
+
+async function runWithFfmpegQueue(cmd) {
+  await new Promise((resolve) => {
+    const tryAcquire = () => {
+      if (activeFfmpegJobs < MAX_CONCURRENT_FFMPEG) {
+        activeFfmpegJobs++;
+        resolve();
+        return;
+      }
+      ffmpegWaitQueue.push(tryAcquire);
+    };
+    tryAcquire();
+  });
+
+  try {
+    return await execFileAsync('ffmpeg', cmd, {
+      timeout: 600000,
+      maxBuffer: 20 * 1024 * 1024,
+    });
+  } finally {
+    activeFfmpegJobs = Math.max(0, activeFfmpegJobs - 1);
+    const next = ffmpegWaitQueue.shift();
+    if (next) next();
+  }
+}
 
 // Auth middleware
 const auth = (req, res, next) => {
@@ -85,7 +114,7 @@ app.post('/api/process', auth, upload.single('video'), async (req, res) => {
     const cmd = buildFFmpegCommand(inputPath, outputPath, config, assets || {});
     console.log('FFmpeg command:', cmd.join(' '));
 
-    await execFileAsync('ffmpeg', cmd, { timeout: 300000 }); // 5 min timeout
+    await runWithFfmpegQueue(cmd);
 
     const stat = fs.statSync(outputPath);
     if (stat.size < 1024) {
@@ -123,15 +152,24 @@ app.post('/api/process-url', auth, async (req, res) => {
 
   try {
     // Download video
-    const response = await fetch(videoUrl);
+    const response = await fetch(videoUrl, { signal: AbortSignal.timeout(45000) });
     if (!response.ok) throw new Error(`Download failed: ${response.status}`);
     const buffer = Buffer.from(await response.arrayBuffer());
     fs.writeFileSync(inputPath, buffer);
 
+    const codecInfo = await probeVideoCodec(inputPath);
+    if (codecInfo.unsupported) {
+      cleanup(inputPath, outputPath);
+      return res.status(422).json({
+        error: 'Unsupported source codec',
+        details: `Codec não suportado: ${codecInfo.codecTag || codecInfo.codecName || 'desconhecido'}`,
+      });
+    }
+
     const cmd = buildFFmpegCommand(inputPath, outputPath, config || {}, assets || {});
     console.log('FFmpeg command:', cmd.join(' '));
 
-    await execFileAsync('ffmpeg', cmd, { timeout: 300000 });
+    await runWithFfmpegQueue(cmd);
 
     const stat = fs.statSync(outputPath);
     if (stat.size < 1024) throw new Error('Output file too small');
@@ -165,6 +203,41 @@ function cleanupSession(sessionId) {
 
 function cleanup(...files) {
   files.forEach(f => { try { fs.unlinkSync(f); } catch {} });
+}
+
+async function probeVideoCodec(filePath) {
+  try {
+    const { stdout } = await execFileAsync('ffprobe', [
+      '-v', 'error',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=codec_name,codec_tag_string,codec_long_name',
+      '-of', 'json',
+      filePath,
+    ], {
+      timeout: 15000,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+
+    const parsed = JSON.parse(stdout || '{}');
+    const stream = parsed?.streams?.[0] || {};
+    const codecName = String(stream.codec_name || '').toLowerCase();
+    const codecTag = String(stream.codec_tag_string || '').toLowerCase();
+    const raw = JSON.stringify(stream).toLowerCase();
+
+    const unsupported =
+      codecName === 'none' ||
+      codecName === '' ||
+      codecName === 'bvc2' ||
+      codecName === 'bytevc2' ||
+      codecTag === 'bvc2' ||
+      codecTag === 'bytevc2' ||
+      raw.includes('bvc2') ||
+      raw.includes('bytevc2');
+
+    return { unsupported, codecName, codecTag };
+  } catch {
+    return { unsupported: false, codecName: '', codecTag: '' };
+  }
 }
 
 function buildFFmpegCommand(inputPath, outputPath, config, assets) {
@@ -258,7 +331,7 @@ function buildFFmpegCommand(inputPath, outputPath, config, assets) {
     }
   }
 
-  const cmd = [...inputs];
+  const cmd = ['-hide_banner', '-loglevel', 'error', '-nostats', ...inputs];
 
   if (filterParts.length > 0) {
     cmd.push('-filter_complex', filterParts.join(';'));
